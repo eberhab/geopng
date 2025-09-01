@@ -1,47 +1,47 @@
 #!/usr/bin/env python3
-# Version: v2025.08.29
+# Version: v2025.09.01
 """
-===============================================================================
-geoapify_from_any.py — unified converter (tracks + markers) for Geoapify Static Maps
-===============================================================================
+================================================================================
+geoapify_from_any.py
+================================================================================
+Unified converter that ingests multiple geodata formats and emits a single
+Geoapify Static Maps POST body JSON.
 
-Features (quick reference)
---------------------------
-- Inputs (multi-file, any mix): .gpx .kml .kmz .trc .nma .nmea .pos
-- Tracks output (default **geojson** FeatureCollection). Also supports
-  **polyline** or **polyline6** under "geometries".
-- Markers from:
-  • .pos files (NMEA-like WPL/HOM)
-  • auto-extracted points/waypoints from GPX/KML/KMZ/TRC/NMEA
-- KML/KMZ smart handling: if a KML/KMZ contains a LineString/gx:Track *and* a
-  very large number of Point Placemarks (typically track samples duplicated as
-  markers), KML-derived markers are skipped to avoid the Geoapify 100-marker cap.
-- Converter-side bbox padding: `--pad-frac` (default 0.20) relative per-side.
-  `--pad-min-deg` default is **0.0** (disabled) and the padded bbox is clamped
-  to world bounds to avoid pole/antimeridian errors.
-- Optional converter-side marker thinning: `--max-markers` (default 100) and
-  `--thin-markers`; keeps first/last markers and samples evenly.
-- Robustness: per-file try/except → problem files are logged as `[SKIP] …`,
-  unless `--strict` is specified.
+Supported inputs (in any mix, multiple files):
+  • GPX (.gpx) — tracks (trk/trkseg/trkpt), routes (rte/rtept), waypoints (wpt)
+  • KML (.kml) and KMZ (.kmz) — LineString, gx:Track, Point Placemarks
+  • TRC/NMEA-like logs (.trc .nma .nmea .log .txt) — numeric lon/lat or NMEA
+  • POS (.pos) — $..WPL and $..HOM waypoints
 
-Notes on labels & sizes
------------------------
-- We never emit {"type":"plain","text":...} overlays; instead, marker text
-  is embedded in the pin via "text" and "textsize" (pixel integer). The
-  renderer will normalize text size to "small"|"medium"|"large" as required
-  by the API when needed.
-- Marker "size" can be a keyword ("small"|"medium"|"large") or explicit pixel
-  integer (the latter is supported by the converter and normalized in the
-  renderer for compatibility).
+Output body features:
+  • Tracks/Routes:
+      - Default: GeoJSON FeatureCollection of LineStrings in WGS84
+      - Alternatives: "geometries" with type "polyline" or "polyline6"
+      - Per-track styling: linecolor, linewidth
+      - Earliest per-file date stored in Feature.properties.date (GeoJSON mode),
+        or in body.meta.date (polyline modes)
+  • Markers:
+      - Extracted from POS, GPX (wpt/rtept names), KML/KMZ (Placemark names),
+        TRC/NMEA ($..WPL/$..HOM)
+      - Labels are included INSIDE the pin (text/textsize) to comply with
+        Geoapify’s marker schema.
+      - Optional converter-side marker thinning (respect API caps).
+  • Area/BBox:
+      - We compute an explicit "area" rect around all points (tracks+markers),
+        apply relative padding (default 20% per side), then clamp to world
+        bounds ([-90..90], [-180..180]) and ensure ordering.
+        Minimum-degree padding defaults to 0.0 (disabled).
 
-Output schema
--------------
-- For geojson mode: {"style","width","height","format","geojson","markers"?,"area","meta"?}
-- For geometries mode: {"style","width","height","format","geometries","markers"?,"area","meta"?}
-- "area" is an object rectangle: {"type":"rect","value":{"lon1","lat1","lon2","lat2"}}
-  The converter sets "meta.padApplied": true with parameters to signal that
-  downstream tools should not re-pad.
-===============================================================================
+Robustness & UX:
+  • Per-file try/except — bad files log as [SKIP] and we continue unless --strict.
+  • Smart KML/KMZ: when a path exists and Placemark Points are numerous (likely
+    track samples as markers), we skip those markers to avoid API limits.
+  • NMEA date extraction: earliest date from $..ZDA / $..RMC if present.
+  • GPX fallback (--gpx-merge-singletons): merge isolated trkpt/rtept into one
+    line when no trkseg/rte present.
+  • Downsampling (--thin) and global capping (--cap-track-points) to mitigate
+    timeouts with huge inputs.
+================================================================================
 """
 import argparse, os, io, json, re, zipfile, sys
 import xml.etree.ElementTree as ET
@@ -52,27 +52,11 @@ ISO = "%Y-%m-%d"
 
 # ---------------- Helpers ----------------
 def _local(tag: str) -> str:
-    """Return the local (namespace-stripped) XML tag name.
-
-    Parameters
-    ----------
-    tag : str
-        XML tag possibly including a namespace like '{ns}Tag'.
-
-    Returns
-    -------
-    str
-        The local tag without the namespace part.
-    """
+    """Return the local name of an XML tag regardless of namespace."""
     return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else tag
 
 def _parse_iso_date(s: str):
-    """Parse various ISO-like timestamps to `date`.
-
-    Accepts 'YYYY-MM-DD', and 'YYYY-MM-DDTHH:MM:SS[Z|+..]'.
-
-    Returns `datetime.date` on success, else None.
-    """
+    """Parse various ISO-like time strings into a date object, else None."""
     try:
         s = s.strip()
         if "T" in s:
@@ -83,28 +67,14 @@ def _parse_iso_date(s: str):
         return None
 
 def _fallback_mtime(path: str) -> Optional[str]:
-    """Return file mtime as YYYY-MM-DD or None on failure."""
+    """Return file modification time as YYYY-MM-DD, or None on error."""
     try:
         return datetime.fromtimestamp(os.path.getmtime(path)).strftime(ISO)
     except Exception:
         return None
 
-# ---------------- Polyline encoder ----------------
 def encode_polyline(points: List[Tuple[float,float]], precision=6) -> str:
-    """Google Encoded Polyline Algorithm for a list of (lat,lon) points.
-
-    Parameters
-    ----------
-    points : list[(float,float)]
-        Latitude/longitude pairs.
-    precision : int
-        Decimal places (5 or 6; we default to 6).
-
-    Returns
-    -------
-    str
-        Encoded polyline string.
-    """
+    """Encode (lat,lon) points as a Google polyline string."""
     factor = 10 ** precision
     prev_lat = 0; prev_lon = 0; out = []
     for lat, lon in points:
@@ -119,14 +89,7 @@ def encode_polyline(points: List[Tuple[float,float]], precision=6) -> str:
     return "".join(out)
 
 def clamp_bbox(lat1: float, lat2: float, lon1: float, lon2: float):
-    """Clamp and order a rectangle to world bounds.
-
-    Ensures:
-      -90 ≤ lat1 ≤ lat2 ≤ 90
-     -180 ≤ lon1 ≤ lon2 ≤ 180
-
-    Returns the clamped (lat1, lat2, lon1, lon2).
-    """
+    """Clamp bbox to world bounds and ensure axis ordering."""
     lat1 = max(-90.0, min(90.0, lat1))
     lat2 = max(-90.0, min(90.0, lat2))
     lon1 = max(-180.0, min(180.0, lon1))
@@ -135,9 +98,9 @@ def clamp_bbox(lat1: float, lat2: float, lon1: float, lon2: float):
     if lon1 > lon2: lon1, lon2 = lon2, lon1
     return lat1, lat2, lon1, lon2
 
-# ---------------- GPX/KML/KMZ date helpers ----------------
+# ---------------- Date helpers ----------------
 def _date_from_gpx(path: str) -> Optional[str]:
-    """Extract earliest <time> from a GPX as YYYY-MM-DD (or None)."""
+    """Extract earliest <time> from a GPX file as YYYY-MM-DD, else None."""
     try:
         root = ET.parse(path).getroot()
     except Exception:
@@ -150,7 +113,7 @@ def _date_from_gpx(path: str) -> Optional[str]:
     return min(times).strftime(ISO) if times else None
 
 def _date_from_kml_root(root: ET.Element) -> Optional[str]:
-    """Extract earliest <when> (or <TimeStamp><when>) from a KML root."""
+    """Extract earliest <when> or <TimeStamp><when> from KML root."""
     times = []
     for el in root.iter():
         if _local(el.tag) == "when" and el.text:
@@ -166,7 +129,7 @@ def _date_from_kml_root(root: ET.Element) -> Optional[str]:
     return min(times).strftime(ISO) if times else None
 
 def _date_from_kml(path: str) -> Optional[str]:
-    """Open a KML and return earliest date string or None."""
+    """Open .kml and delegate to _date_from_kml_root; returns YYYY-MM-DD or None."""
     try:
         root = ET.parse(path).getroot()
     except Exception:
@@ -174,7 +137,7 @@ def _date_from_kml(path: str) -> Optional[str]:
     return _date_from_kml_root(root)
 
 def _date_from_kmz(path: str) -> Optional[str]:
-    """Open a KMZ (zip), find a KML inside, and return earliest date or None."""
+    """Open .kmz, find contained .kml, and extract earliest timestamp; else None."""
     try:
         with zipfile.ZipFile(path, "r") as zf:
             name = "doc.kml" if "doc.kml" in zf.namelist() else None
@@ -189,12 +152,11 @@ def _date_from_kmz(path: str) -> Optional[str]:
     except Exception:
         return None
 
-# ---------------- NMEA date helpers ----------------
 _ZDA_RE = re.compile(r'^\$(?:GP|GN|GL)ZDA,(?:[^,]*),([0-3]\d),([01]\d),(\d{4})')
 _RMC_RE = re.compile(r'^\$(?:GP|GN|GL)RMC,[^,]*,[AV],[^,]*,[NS],[^,]*,[EW],[^,]*,[^,]*,([0-3]\d)([01]\d)(\d{2})')
 
 def _date_from_nmea_like(path: str) -> Optional[str]:
-    """Parse earliest date from NMEA ZDA/RMC sentences in a text file (if any)."""
+    """Scan a TRC/NMEA-like text file for earliest ZDA/RMC date; returns YYYY-MM-DD or None."""
     best = None
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -215,7 +177,7 @@ def _date_from_nmea_like(path: str) -> Optional[str]:
 
 # ---------------- Parsers ----------------
 def parse_gpx_segments(gpx_path: str) -> List[List[Tuple[float,float]]]:
-    """Return list of GPX line segments (each a list of (lat,lon))."""
+    """Parse GPX tracks and routes to a list of segments; each segment is [(lat,lon), ...]."""
     try:
         root = ET.parse(gpx_path).getroot()
     except Exception:
@@ -248,7 +210,7 @@ def parse_gpx_segments(gpx_path: str) -> List[List[Tuple[float,float]]]:
     return segs
 
 def _parse_root_from_kml_or_kmz(path: str) -> ET.Element:
-    """Open .kml or .kmz and return parsed XML root (raises on wrong type)."""
+    """Open a .kml or .kmz file and return the parsed XML root element."""
     low = path.lower()
     if low.endswith(".kml"):
         return ET.parse(path).getroot()
@@ -265,7 +227,7 @@ def _parse_root_from_kml_or_kmz(path: str) -> ET.Element:
     raise RuntimeError("Input must be .kml or .kmz")
 
 def parse_kmx_segments(path: str) -> List[List[Tuple[float,float]]]:
-    """Parse KML/KMZ LineStrings and gx:Track coords into segments."""
+    """Parse KML/KMZ LineStrings and gx:Track coords into segments of (lat,lon)."""
     try:
         root = _parse_root_from_kml_or_kmz(path)
     except Exception:
@@ -302,24 +264,9 @@ def parse_kmx_segments(path: str) -> List[List[Tuple[float,float]]]:
 
 # ---- TRC/NMEA helpers ----
 FLOAT_RE = re.compile(r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?')
-def plausible_lon(x): 
-    """Return True if x is a plausible longitude.""" 
-    return -180.0 <= x <= 180.0
-def plausible_lat(y): 
-    """Return True if y is a plausible latitude.""" 
-    return -90.0 <= y <= 90.0
 
-def dm_to_dec(dm, hemi=None):
-    """Convert NMEA degrees-minutes float to decimal degrees; apply hemisphere."""
-    try: f = float(dm)
-    except Exception: return None
-    deg = int(f // 100.0); minutes = f - deg*100.0
-    dec = deg + minutes/60.0
-    if hemi in ("S","W"): dec = -dec
-    return dec
-
-def parse_nmea_line(line):
-    """Parse a single NMEA RMC/GGA line into (lat,lon) or None."""
+def parse_nmea_line(line: str) -> Optional[Tuple[float,float]]:
+    """Parse a single NMEA sentence of type RMC/GGA into (lat,lon) if possible."""
     if not (line.startswith("$GP") or line.startswith("$GN") or line.startswith("$GL")):
         return None
     p = line.strip().split(",")
@@ -339,30 +286,38 @@ def parse_nmea_line(line):
         return None
     return None
 
-def find_pair(nums, force=None):
-    """Heuristically find adjacent (lat,lon) or (lon,lat) in a numeric list.
-
-    If `force` is 'lonlat' or 'latlon', restrict matching accordingly.
-    """
+def find_pair(nums, force=None) -> Optional[Tuple[float,float]]:
+    """From a list of floats, find an adjacent (lat,lon) or (lon,lat) pair."""
     n = len(nums)
     if force == "lonlat":
         for i in range(n-1):
             a,b = nums[i], nums[i+1]
-            if plausible_lon(a) and plausible_lat(b): return (b,a)
+            if -180.0 <= a <= 180.0 and -90.0 <= b <= 90.0: return (b,a)
         return None
     if force == "latlon":
         for i in range(n-1):
             a,b = nums[i], nums[i+1]
-            if plausible_lat(a) and plausible_lon(b): return (a,b)
+            if -90.0 <= a <= 90.0 and -180.0 <= b <= 180.0: return (a,b)
         return None
     for i in range(n-1):
         a,b = nums[i], nums[i+1]
-        if plausible_lon(a) and plausible_lat(b): return (b,a)
-        if plausible_lat(a) and plausible_lon(b): return (a,b)
+        if -180.0 <= a <= 180.0 and -90.0 <= b <= 90.0: return (b,a)
+        if -90.0 <= a <= 90.0 and -180.0 <= b <= 180.0: return (a,b)
     return None
 
+def dm_to_dec(dm, hemi=None) -> Optional[float]:
+    """Convert NMEA 'degrees+minutes' (DM) value to decimal degrees."""
+    try:
+        f = float(dm)
+    except Exception:
+        return None
+    deg = int(f // 100.0); minutes = f - deg*100.0
+    dec = deg + minutes/60.0
+    if hemi in ("S","W"): dec = -dec
+    return dec
+
 def parse_trc_segments(path: str, order=None, split_on_empty=False) -> List[List[Tuple[float,float]]]:
-    """Parse .trc/.nma/.nmea generic log into segments of (lat,lon)."""
+    """Parse TRC/NMEA-like text into segments of (lat,lon)."""
     segs = [[]]
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -389,16 +344,16 @@ WPL_RE = re.compile(r'^\$(?:GP|GN|GL)WPL,([^,]+),([NS]),([^,]+),([EW]),([^,*]+)'
 HOM_RE = re.compile(r'^\$(?:GP|GN|GL)HOM,([^,]+),([EW]),([^,]+),([NS])')
 
 def dm_to_deg(dm: str) -> Optional[float]:
-    """Convert NMEA ddmm.mmmm (float) to decimal degrees (positive)."""
-    try: v = float(dm)
-    except Exception: return None
+    """Convert WPL/HOM DM value to decimal degrees (unsigned)."""
+    try:
+        v = float(dm)
+    except Exception:
+        return None
     deg = int(v // 100); minutes = v - 100*deg
     return deg + minutes/60.0
 
 def parse_pos_file(path: str):
-    """Parse .pos (WPL/HOM) to a list of (lat,lon,name). Unnamed entries
-    are auto-named using the filename stem + counter.
-    """
+    """Parse a .pos file into [(lat,lon,name), ...]."""
     rows = []
     stem = os.path.splitext(os.path.basename(path))[0]
     try:
@@ -435,7 +390,7 @@ def parse_pos_file(path: str):
     return out
 
 def parse_positions_gpx(path: str):
-    """Extract (lat,lon,name) from GPX waypoints (<wpt>) or named route points."""
+    """Extract GPX waypoint and named route points into markers."""
     out = []
     try:
         root = ET.parse(path).getroot()
@@ -463,7 +418,7 @@ def parse_positions_gpx(path: str):
     return out
 
 def parse_positions_kmx(path: str):
-    """Extract (lat,lon,name) points from KML/KMZ Placemarks with <Point>."""
+    """Extract KML/KMZ Placemark Point coordinates and names into markers."""
     out = []
     try:
         root = _parse_root_from_kml_or_kmz(path)
@@ -490,7 +445,7 @@ def parse_positions_kmx(path: str):
     return out
 
 def parse_positions_trc(path: str):
-    """Extract (lat,lon,name) from NMEA-like WPL/HOM records in TRC/log files."""
+    """Extract named waypoints from TRC/NMEA-like files ($..WPL/$..HOM)."""
     out = []
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -517,13 +472,13 @@ def parse_positions_trc(path: str):
     return out
 
 def resolve_marker_size_px(size_name: str, size_px: Optional[int]) -> int:
-    """Return pixel size for a marker from a keyword or explicit px override."""
+    """Derive pixel size from keyword unless an explicit pixel value is given."""
     if size_px is not None and size_px > 0: return size_px
     return {"small":36,"medium":48,"large":64}.get(size_name, 48)
 
 # ---------------- Main ----------------
 def main():
-    """CLI entry: build a Geoapify Static Maps POST body from inputs."""
+    """CLI — Convert inputs to Geoapify Static Maps POST body JSON."""
     ap = argparse.ArgumentParser(description="Convert GPX/KML/KMZ/TRC/NMEA/POS (multi-file) to a single Geoapify Static Maps POST body.")
     ap.add_argument("inputs", nargs="+", help="Input files (.gpx .kml .kmz .trc .nma .nmea .pos)")
     ap.add_argument("-o","--output", default="geoapify_body.json", help="Output JSON file")
@@ -532,13 +487,15 @@ def main():
     ap.add_argument("--height", type=int, default=800, help="Image height")
     ap.add_argument("--format", choices=["png","jpeg"], default="png", help="Image format")
     ap.add_argument("--pad-frac", type=float, default=0.20, help="BBox padding fraction per side")
-    ap.add_argument("--pad-min-deg", type=float, default=0.0, help="Minimum padding per side in degrees (0.0 disables)")
+    ap.add_argument("--pad-min-deg", type=float, default=0.0, help="Min padding per side in degrees (0.0 = disabled)")
 
     # Line styling
     ap.add_argument("--out-type", choices=["geojson","polyline","polyline6"], default="geojson", help="Geometry encoding for tracks/routes")
     ap.add_argument("--linecolor", default="#0066ff", help="Track line color")
     ap.add_argument("--linewidth", type=int, default=5, help="Track line width (px)")
     ap.add_argument("--thin", type=int, default=1, help="Downsample: keep every Nth point")
+    ap.add_argument("--cap-track-points", type=int, default=10000,
+                   help="Cap total number of track points across all segments; adaptive thinning is applied if exceeded (0 = unlimited).")
     ap.add_argument("--gpx-merge-singletons", action="store_true", help="If all GPX segments have <2 points, merge all trkpt/rtept into one segment")
 
     # TRC options
@@ -561,7 +518,7 @@ def main():
 
     # Positions auto-extract
     ap.add_argument("--auto-positions", action="store_true", default=True, help="Extract waypoint/point markers from all inputs")
-    ap.add_argument("--no-auto-positions", dest="auto_positions", action="store_false", help="Disable auto position extraction")
+    ap.add_argument("--no-auto-positions", dest="auto_positions", action="store_false")
 
     # Robustness
     ap.add_argument("--strict", action="store_true", help="Abort on first bad file instead of skipping")
@@ -573,6 +530,7 @@ def main():
     markers = []
     seen_markers = set()
     dates = []
+    collected_segments = []  # list of {'points': [(lat,lon),...], 'date': 'YYYY-MM-DD' or None}
 
     min_lat = float('inf'); min_lon = float('inf')
     max_lat = float('-inf'); max_lon = float('-inf')
@@ -640,48 +598,15 @@ def main():
                 segs = [seg[::args.thin] for seg in segs if len(seg) >= 2]
             if date: dates.append(date)
 
-            # Emit tracks
+            # Collect segments; update bounds
             if segs:
-                if args.out_type == "geojson":
-                    for seg in segs:
-                        for (lat,lon) in seg:
-                            if lat < min_lat: min_lat = lat
-                            if lat > max_lat: max_lat = lat
-                            if lon < min_lon: min_lon = lon
-                            if lon > max_lon: max_lon = lon
-                        feat = {
-                            "type": "Feature",
-                            "properties": {"linecolor": args.linecolor, "linewidth": args.linewidth},
-                            "geometry": {"type": "LineString", "coordinates": [[lon,lat] for (lat,lon) in seg]}
-                        }
-                        if date: feat["properties"]["date"] = date
-                        features.append(feat)
-                elif args.out_type == "polyline6":
-                    for seg in segs:
-                        for (lat,lon) in seg:
-                            if lat < min_lat: min_lat = lat
-                            if lat > max_lat: max_lat = lat
-                            if lon < min_lon: min_lon = lon
-                            if lon > max_lon: max_lon = lon
-                        geometries.append({
-                            "type": "polyline6",
-                            "value": encode_polyline(seg, precision=6),
-                            "linecolor": args.linecolor,
-                            "linewidth": args.linewidth
-                        })
-                else:
-                    for seg in segs:
-                        for (lat,lon) in seg:
-                            if lat < min_lat: min_lat = lat
-                            if lat > max_lat: max_lat = lat
-                            if lon < min_lon: min_lon = lon
-                            if lon > max_lon: max_lon = lon
-                        geometries.append({
-                            "type": "polyline",
-                            "value": [{"lat":lat, "lon":lon} for (lat,lon) in seg],
-                            "linecolor": args.linecolor,
-                            "linewidth": args.linewidth
-                        })
+                for seg in segs:
+                    for (lat,lon) in seg:
+                        if lat < min_lat: min_lat = lat
+                        if lat > max_lat: max_lat = lat
+                        if lon < min_lon: min_lon = lon
+                        if lon > max_lon: max_lon = lon
+                    collected_segments.append({'points': seg, 'date': date})
 
             # Auto-positions (markers) after we know if KML had segments
             if args.auto_positions and ext in ("gpx","kml","kmz","trc","nma","nmea","log","txt"):
@@ -728,6 +653,65 @@ def main():
                 raise
             continue
 
+    # ---- Track point capping + emission ----
+    def _thin_by_step(seg, step):
+        if step <= 1: return seg
+        if len(seg) <= 2: return seg
+        core = seg[1:-1:step]
+        out = [seg[0]] + core + [seg[-1]]
+        return out if len(out) >= 2 else seg
+
+    total_pts = sum(len(s['points']) for s in collected_segments)
+    print(f"[INFO] track points (before cap): {total_pts}", file=sys.stderr)
+    if args.cap_track_points and total_pts > args.cap_track_points:
+        step = (total_pts + (args.cap_track_points - 1)) // args.cap_track_points  # ceil
+        new_segments = []
+        for s in collected_segments:
+            pts = _thin_by_step(s['points'], step)
+            if len(pts) >= 2:
+                new_segments.append({'points': pts, 'date': s['date']})
+        collected_segments = new_segments
+        total_pts = sum(len(s['points']) for s in collected_segments)
+        print(f"[INFO] track points (after cap step={step}): {total_pts}", file=sys.stderr)
+
+    # Emit to chosen geometry encoding
+    if args.out_type == 'geojson' and collected_segments:
+        for s in collected_segments:
+            seg = s['points']; date = s['date']
+            features.append({
+                'type': 'Feature',
+                'properties': {'linecolor': args.linecolor, 'linewidth': args.linewidth, **({'date': date} if date else {})},
+                'geometry': {'type': 'LineString', 'coordinates': [[lon,lat] for (lat,lon) in seg]}
+            })
+    elif args.out_type == 'polyline6' and collected_segments:
+        for s in collected_segments:
+            seg = s['points']
+            geometries.append({
+                'type': 'polyline6',
+                'value': encode_polyline(seg, precision=6),
+                'linecolor': args.linecolor,
+                'linewidth': args.linewidth
+            })
+    elif args.out_type != 'geojson' and collected_segments:
+        for s in collected_segments:
+            seg = s['points']
+            geometries.append({
+                'type': 'polyline',
+                'value': [{'lat':lat, 'lon':lon} for (lat,lon) in seg],
+                'linecolor': args.linecolor,
+                'linewidth': args.linewidth
+            })
+
+    # Log marker count
+    print(f"[INFO] markers: {len(markers)}", file=sys.stderr)
+
+    # Recompute bounds after capping (for accurate area)
+    if collected_segments:
+        min_lat = min(min_lat, min(min(lat for lat,_ in s['points']) for s in collected_segments))
+        max_lat = max(max_lat, max(max(lat for lat,_ in s['points']) for s in collected_segments))
+        min_lon = min(min_lon, min(min(lon for _,lon in s['points']) for s in collected_segments))
+        max_lon = max(max_lon, max(max(lon for _,lon in s['points']) for s in collected_segments))
+
     # Build body
     body = {"style": args.style, "width": args.width, "height": args.height, "format": args.format}
 
@@ -752,7 +736,7 @@ def main():
     if "geojson" in body and body["geojson"].get("features") == []:
         del body["geojson"]
 
-    # Padded bbox (object form) + clamp
+    # Padded & clamped bbox (object form)
     if min_lat != float('inf'):
         dlat = max_lat - min_lat; dlon = max_lon - min_lon
         plat = max(args.pad_frac * dlat, args.pad_min_deg)

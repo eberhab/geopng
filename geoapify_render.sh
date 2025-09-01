@@ -1,69 +1,45 @@
 #!/usr/bin/env bash
-# Version: v2025.08.29
+# Version: v2025.09.01
 # ============================================================================
 # geoapify_render.sh — robust, well-documented renderer for Geoapify Static Maps
 # ============================================================================
 #
-# Pipeline
-# --------
-# 1) Calls the unified converter (geoapify_from_any.py) on any number of inputs
-#    (.gpx .kml .kmz .trc .nma .nmea .pos), producing a POST body (JSON).
-# 2) Normalizes the payload for reliability:
-#    - marker pin size & in-pin label text size → "small|medium|large" keywords
-#    - ensures an "area" bbox; if converter already padded (meta.padApplied=true),
-#      it is trusted; otherwise we apply padding here.
-#    - clamps the bbox to world bounds to avoid pole/antimeridian API errors.
-#    - injects scaleFactor into the body (and passes in the URL as well).
-# 3) POSTs the JSON to Geoapify Static Maps; on error, retries without marker
-#    labels, and finally attempts a GET fallback for markers-only payloads.
-# 4) Adds a date overlay (bottom-right) using the earliest date found in the JSON.
+# What this does
+#  1) Calls the unified converter (geoapify_from_any.py) on any number of inputs
+#     (.gpx .kml .kmz .trc .nma .nmea .pos), producing a POST body (JSON).
+#  2) Normalizes and safeguards the payload:
+#       - Marker sizes & text sizes normalized to Geoapify's keywords
+#       - area bbox is ensured and padded if missing; otherwise trusted when
+#         converter indicated meta.padApplied=true; then we clamp to world bounds
+#       - scaleFactor is injected into the body
+#  3) POSTs the body to Geoapify Static Maps. If the POST fails, we retry after
+#     removing marker labels (text/textsize). If still failing and it's a
+#     markers-only map, we build a GET URL fallback (marker strings).
+#  4) Writes the returned image and optionally adds a bottom-right date overlay.
 #
-# Key behavior
-# ------------
-# - The converter does bbox padding by default: 20% per side, min-degree padding
-#   is disabled (0.0). Renderer only pads if the converter didn't set padApplied.
-# - KML/KMZ with tracks + many Placemarks: the converter skips KML markers to
-#   avoid hitting the 100-marker limit.
-# - Marker labels live inside pins; we normalize their sizes to API keywords.
-# - '--thin-markers' is implemented in the converter (renderer switch exists
-#   but defaults OFF — the converter should handle it).
-# - '-K' keeps the final JSON next to the output with a unique run id.
+# CLI flags
+#  -o OUTPUT.png  : output image filename (default: next to first input)
+#  -K             : keep the final JSON next to the image with a unique run id
 #
-# Flags
-# -----
-#   -o OUTPUT.png  : output filename (default: next to first input)
-#   -K             : keep final JSON alongside image with a unique run id
-#
-# Environment variables
-# ---------------------
-#   GEOAPIFY_KEY     : API key (embedded default can be overridden)
-#   GEOAPIFY_STYLE   : map style (default osm-carto)
-#   GEOAPIFY_LANG    : language (default de)
-#   GEOAPIFY_SCALE   : scale factor (default 2)
-#   GEOAPIFY_WIDTH   : width px (default 1280)
-#   GEOAPIFY_HEIGHT  : height px (default 800)
-#   GEOAPIFY_FORMAT  : png|jpeg (default png)
-#   GEOAPIFY_OUTTYPE : geojson|polyline|polyline6 (default geojson)
-#   GEOAPIFY_GPX_MERGE_SINGLETONS : 1/0 merge singleton GPX points (default 1)
-#   GEOAPIFY_LINECOLOR : track line color (default #0066ff)
-#   GEOAPIFY_LINEWIDTH : track line width px (default 5)
-#   GEOAPIFY_THIN      : keep every Nth track point (default 1 = no thinning)
-#   POS_MARKER_COLOR   : marker color (default #D32F2F)
-#   POS_MARKER_SIZE    : small|medium|large (default medium)
-#   POS_MARKER_SIZE_PX : explicit px size (overrides keyword)
-#   POS_NO_TEXT        : 1 to disable in-pin labels
-#   POS_TEXTSIZE       : in-pin label size (px, default 18) — normalized to keyword
-#   POS_MAX_NAME_LEN   : truncate long labels (default 40)
-#   DATE_FMT           : overlay date format (default %Y-%m-%d)
-#   LABEL_PAD          : overlay padding (default 18)
-#   GEOAPIFY_AREA_PAD_FRAC : bbox padding fraction per side (default 0.20)
-#   GEOAPIFY_AREA_PAD_MIN_DEG : minimum padding per side (default 0.0 = disabled)
-#   GEOAPIFY_MAX_MARKERS  : cap markers (default 100, API limit)
-#   GEOAPIFY_THIN_MARKERS : renderer-side thinning (default 0; prefer converter)
-#
-# Usage
-# -----
-#   ./geoapify_render.sh [-o out.png] [-K] input1 [input2 ...]
+# Key environment variables
+#  GEOAPIFY_KEY     : API key (overrides embedded default)
+#  GEOAPIFY_STYLE   : map style (default osm-carto)
+#  GEOAPIFY_LANG    : language (default de)
+#  GEOAPIFY_SCALE   : scaleFactor (default 2)
+#  GEOAPIFY_WIDTH   : width in px (default 1280), GEOAPIFY_HEIGHT (default 800)
+#  GEOAPIFY_FORMAT  : png|jpeg (default png)
+#  GEOAPIFY_OUTTYPE : geojson|polyline|polyline6 (default geojson)
+#  GEOAPIFY_GPX_MERGE_SINGLETONS : 1/0 (default 1)
+#  GEOAPIFY_LINECOLOR / GEOAPIFY_LINEWIDTH
+#  GEOAPIFY_THIN    : keep every Nth track point (default 1)
+#  GEOAPIFY_CAP_TRACK_POINTS : cap total track points (default 10000)
+#  POS_MARKER_*     : marker styling / labels
+#  DATE_FMT         : overlay date strftime (default %Y-%m-%d)
+#  LABEL_PAD        : overlay padding px (default 18)
+#  GEOAPIFY_AREA_PAD_FRAC : bbox relative padding fraction (default 0.20)
+#  GEOAPIFY_AREA_PAD_MIN_DEG : bbox min-degree padding (default 0.0 = disabled)
+#  GEOAPIFY_MAX_MARKERS    : cap markers (default 100)
+#  GEOAPIFY_THIN_MARKERS   : renderer-side thinning (default 0; prefer converter)
 # ============================================================================
 
 set -euo pipefail
@@ -88,9 +64,7 @@ shift $((OPTIND - 1))
 [[ $# -ge 1 ]] || usage
 
 # ---- Environment / defaults ----
-# Embedded default API key per user request (override with GEOAPIFY_KEY env):
 KEY="${GEOAPIFY_KEY:-4f57159fee49457e96715cea917cc6d4}"
-
 STYLE="${GEOAPIFY_STYLE:-osm-carto}"
 LANG="${GEOAPIFY_LANG:-de}"
 SCALE="${GEOAPIFY_SCALE:-2}"
@@ -102,6 +76,7 @@ MERGE_SINGLETONS="${GEOAPIFY_GPX_MERGE_SINGLETONS:-1}"
 LINECOLOR="${GEOAPIFY_LINECOLOR:-#0066ff}"
 LINEWIDTH="${GEOAPIFY_LINEWIDTH:-5}"
 THIN="${GEOAPIFY_THIN:-1}"
+CAP_TRACK_POINTS="${GEOAPIFY_CAP_TRACK_POINTS:-10000}"
 
 POS_MARKER_COLOR="${POS_MARKER_COLOR:-#D32F2F}"
 POS_MARKER_SIZE="${POS_MARKER_SIZE:-medium}"
@@ -125,7 +100,7 @@ CONVERTER="$SCRIPT_DIR/geoapify_from_any.py"
 
 first="$1"; first_dir="$(cd "$(dirname "$first")" && pwd)"
 first_base="$(basename "$first")"; first_stem="${first_base%.*}"
-PNG_OUT="${OUTFILE:-$first_dir/$first_stem.$FORMAT}"
+PNG_OUT="${OUTFILE:-$first_dir/$first_stem.png}"
 
 # ---- Temps and cleanup ----
 RESP="$(mktemp -t geoapify_resp.XXXXXX)"
@@ -146,6 +121,7 @@ trap cleanup EXIT
 # ---- Build converter args ----
 ARGS=( --style "$STYLE" --width "$WIDTH" --height "$HEIGHT" --format "$FORMAT"
        --out-type "$OUTTYPE" --linecolor "$LINECOLOR" --linewidth "$LINEWIDTH" --thin "$THIN"
+       --cap-track-points "$CAP_TRACK_POINTS"
        --marker-color "$POS_MARKER_COLOR" --marker-size "$POS_MARKER_SIZE" --contentsize "$POS_TEXTSIZE"
        --max-name-len "$POS_MAX_NAME_LEN" --max-markers "$MAX_MARKERS"
        --pad-frac "$PAD_FRAC" --pad-min-deg "$MIN_PAD_DEG" -o "$FINAL" )
@@ -164,7 +140,7 @@ if jq -e '(((.markers // []) | length) + ((.geometries // []) | length) + (((.ge
   exit 0
 fi
 
-# ---- Normalize payload (sizes, ensure/pad area if needed, clamp) ----
+# ---- Normalize payload (sizes, ensure/pad area if needed, clamp bbox) ----
 tmp_norm="$(mktemp -t geoapify_body.norm.XXXXXX.json)"
 jq --argjson sc "$SCALE" --argjson pf "$PAD_FRAC" --argjson pm "$MIN_PAD_DEG" '
   def size_to_keyword(s): if (s|type)=="string" then s else (if s>=64 then "large" elif s>=48 then "medium" else "small" end) end;
@@ -190,10 +166,12 @@ jq --argjson sc "$SCALE" --argjson pf "$PAD_FRAC" --argjson pm "$MIN_PAD_DEG" '
         else . end
     ) end;
   def clamp(v;lo;hi): (if v<lo then lo elif v>hi then hi else v end);
-  def clamp_rect: {lat1: clamp(.lat1;-90;90), lat2: clamp(.lat2;-90;90),
-                    lon1: clamp(.lon1;-180;180), lon2: clamp(.lon2;-180;180)}
-                   | (if .lat1 > .lat2 then {lat1:.lat2,lat2:.lat1,lon1:.lon1,lon2:.lon2} else . end)
-                   | (if .lon1 > .lon2 then {lat1:.lat1,lat2:.lat2,lon1:.lon2,lon2:.lon1} else . end);
+  def clamp_rect: {
+    lat1: clamp(.lat1;-90;90), lat2: clamp(.lat2;-90;90),
+    lon1: clamp(.lon1;-180;180), lon2: clamp(.lon2;-180;180)
+  }
+  | (if .lat1 > .lat2 then {lat1:.lat2,lat2:.lat1,lon1:.lon1,lon2:.lon2} else . end)
+  | (if .lon1 > .lon2 then {lat1:.lat1,lat2:.lat2,lon1:.lon2,lon2:.lon1} else . end);
   .scaleFactor = $sc
   | (if has("markers") then .markers |= map(
         .size = size_to_keyword(.size // "medium")
@@ -224,7 +202,7 @@ if [[ "$HTTP_CODE" != "200" ]]; then
   echo "--- request body (first 200 lines) ---" >&2; jq . "$FINAL" 2>/dev/null | head -200 >&2 || head -200 "$FINAL" >&2
   echo "--- server response (first 200 lines) ---" >&2; head -200 "$RESP" >&2
 
-  # Retry without marker labels (strip text/textsize that occasionally triggers 400s)
+  # Retry without marker labels (strip text/textsize)
   STRIPPED="$(mktemp -t geoapify_body.stripped.XXXXXX.json)"
   jq 'if has("markers") then .markers |= map( del(.text) | del(.textsize) ) else . end' "$FINAL" > "$STRIPPED" || STRIPPED="$FINAL"
 
