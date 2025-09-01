@@ -6,33 +6,61 @@ Point it at your GPX/KML/KMZ/TRC/POS files and get a PNG with your path, markers
 This is a **vibe coding** project: built iteratively with real-world files, pragmatic choices, and tiny quality-of-life tweaks—so you can spend less time fiddling and more time sharing where you’ve been.
 
 ## Why you might like it
-- **One command to map**: `geopng file.gpx` ⇒ `file.png`
+- **One command to map**: `./geoapify_render.sh file.gpx` ⇒ `file.png`
 - **Understands many formats**: GPX, KML, KMZ, TRC/NMEA logs, POS waypoints
 - **Looks good by default**: sane styles, line colors, and a date overlay
 - **Handles messy data**: skips broken files, caps huge tracks, and avoids API limits
 - **Smart framing**: automatic bounding box with padding (no cut-off corners)
 
-## Quick start
+## Requirements
+
+**Ubuntu/Debian packages** (no Python pip deps needed):
 ```bash
-# 1) Set your Geoapify API key (required)
-export GEOAPIFY_KEY="YOUR_GEOAPIFY_KEY"
-
-# 2) Render a single track
-geopng MyRun.gpx
-
-# 3) Combine formats and keep the request JSON for debugging
-geopng -K trip.kmz waypoints.pos track.trc
-
-# 4) Set a custom output name
-geopng -o holiday.png Spanien09.kmz
-
+sudo apt update
+sudo apt install -y python3 curl jq imagemagick
+# (Optional) If you prefer GraphicsMagick for the date overlay:
+# sudo apt install -y graphicsmagick
 ```
 
-You’ll find the output PNG next to your input file. With `-K`, the exact POST body is kept for troubleshooting.
+**Why these?**
+- `python3` runs the converter (`geoapify_from_any.py`)
+- `curl` sends the request to Geoapify
+- `jq` tidies the JSON and helps with safe fallbacks
+- `imagemagick` (or `graphicsmagick`) adds the bottom-right date overlay
+
+## Quick start
+
+1) **Get geoapify API key**:
+https://myprojects.geoapify.com/projects
+
+2) **Set your Geoapify API key (required)**:
+```bash
+export GEOAPIFY_KEY="YOUR_GEOAPIFY_KEY"
+```
+
+3) **Render a single track**:
+```bash
+./geoapify_render.sh MyRun.gpx
+```
+
+4) **Combine formats and keep the request JSON for debugging**:
+```bash
+./geoapify_render.sh -K trip.kmz waypoints.pos track.trc
+```
+
+5) **Set a custom output name**:
+```bash
+./geoapify_render.sh -o holiday.png Spanien09.kmz
+```
+
+> Tip: you can also inline the key per call:
+```bash
+GEOAPIFY_KEY="YOUR_GEOAPIFY_KEY" ./geoapify_render.sh MyRun.gpx
+```
 
 ## How it works (high level)
-- A Python converter unifies all inputs into one Geoapify Static Maps request.
-- A tiny bash script sends it off, retries sensibly, and adds the date overlay.
+- A Python converter (`geoapify_from_any.py`) unifies all inputs into one Geoapify Static Maps request.
+- A small Bash wrapper (`geoapify_render.sh`) sends it, retries sensibly, and adds the date overlay.
 - It quietly thins overly dense tracks and trims marker labels to keep things smooth.
 
 ## Notes
